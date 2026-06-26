@@ -1,4 +1,5 @@
 import os, sys, json, asyncio, cloudscraper, random
+from curl_cffi import requests
 
 # -------------------- 文件路径 --------------------
 def get_base_path():
@@ -45,6 +46,39 @@ def test_proxy_cloudscraper(proxy: str, test_url: str, timeout=20, log_func=prin
             if verbose: log_func(f"   ❌ 失败 ({scheme}) {type(e).__name__}")
     return result
 
+def test_proxy_curl(proxy: str, test_url: str, timeout=20, log_func=print, verbose=True):
+    result = {"http": False, "https": False}
+
+    if verbose:
+        log_func(f"\n🔍 测试代理: {proxy}")
+
+    for scheme in ("https", "http"):
+        proxy_url = f"{scheme}://{proxy}"
+        proxies = {"http": proxy_url, "https": proxy_url}
+
+        try:
+            if verbose:
+                log_func(f"   ▶ 访问 {test_url} via {proxy_url}")
+
+            resp = requests.get(
+                test_url,
+                proxies=proxies,
+                impersonate="chrome120",  # 模拟 Chrome 120 指纹
+                timeout=timeout,
+                verify=False  # 避免某些代理证书问题
+            )
+
+            if resp.status_code == 200:
+                result[scheme] = True
+                if verbose:
+                    log_func(f"   ✅ 可用代理 ({scheme})")
+
+        except Exception as e:
+            if verbose:
+                log_func(f"   ❌ 失败 ({scheme}) {type(e).__name__}")
+
+    return result
+
 # -------------------- 批量测试 --------------------
 async def test_proxies_batch(proxy_dict, test_url, batch_size=3, log_func=print, verbose=True, max_keep=50):
     keys = list(proxy_dict.keys())
@@ -57,7 +91,7 @@ async def test_proxies_batch(proxy_dict, test_url, batch_size=3, log_func=print,
         total_proxies = len(proxy_dict)
         fail_threshold = 4 if total_proxies > 30 else 3 if total_proxies > 15 else 2 if total_proxies > 5 else 1
 
-        tasks = [asyncio.to_thread(test_proxy_cloudscraper, p, test_url, 20, log_func, verbose) for p in batch]
+        tasks = [asyncio.to_thread(test_proxy_curl, p, test_url, 20, log_func, verbose) for p in batch]
         results = await asyncio.gather(*tasks)
 
         for proxy, res in zip(batch, results):

@@ -1,7 +1,8 @@
-import os, sys, re, asyncio, aiohttp, requests, random, json, cloudscraper
+import os, sys, re, asyncio, aiohttp, random, json, cloudscraper
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from tools.proxy_manager import fetch_free_proxies, get_working_proxy, remove_bad_proxy
+from curl_cffi import requests as curl_requests
 
 # -------------------- 配置 --------------------
 USER_AGENTS = [
@@ -92,8 +93,34 @@ async def download_audio(session, audio_url, audio_file_name, status, proxy=None
         status["failed"].append(audio_file_name)
         return None
 
+def fetch_html_curl(url, headers, proxy=None, timeout=30):
+    proxies = None
+    if proxy:
+        proxies = {"http": f"http://{proxy}", "https": f"http://{proxy}"}
+
+    resp = curl_requests.get(
+        url,
+        headers=headers,
+        proxies=proxies,
+        impersonate="chrome120",
+        timeout=timeout,
+        verify=False
+    )
+    resp.raise_for_status()
+    return resp.text, resp.cookies
+
+def fetch_html_cloudscraper(scraper, url, proxy=None, timeout=30):
+    proxies = None
+    if proxy:
+        proxies = {"http": proxy, "https": proxy}
+
+    resp = scraper.get(url, proxies=proxies, timeout=timeout, verify=True)
+    resp.raise_for_status()
+    return resp.text, scraper.cookies
+
 # -------------------- 抓取角色 --------------------
 async def fetch_character_data(session, character_name, url, language="zh", proxy=None, scraper=None, log_func: callable = None, game=""):
+    USE_CURL = True  # 或 False
     log = print if log_func is None else log_func
     await asyncio.sleep(random.uniform(2, 5))
 
@@ -147,22 +174,34 @@ async def fetch_character_data(session, character_name, url, language="zh", prox
     else:
         scraper.headers.update({"Referer": f"{url}"})
 
-    proxies = {"http": proxy, "https": proxy} if proxy else None
-
-    try:
-        await asyncio.to_thread(scraper.get, url, timeout=20, proxies=proxies, verify=True)
-        await asyncio.to_thread(scraper.get, f"{base}/wiki/Main_Page", timeout=20, proxies=proxies, verify=True)
-    except Exception:
-        pass
-
     new_soup = None
+    headers = scraper.headers if scraper else {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Referer": url,
+    }
+
     for attempt in range(3):
         try:
-            use_proxies = proxies if attempt == 0 else None
-            verify_flag = False if attempt == 2 else True
-            html = await asyncio.to_thread(scraper.get, new_url, timeout=30, proxies=use_proxies, verify=verify_flag)
-            html.raise_for_status()
-            new_soup = BeautifulSoup(html.text, 'html.parser')
+            if USE_CURL:
+                # curl_cffi 版本
+                text, cookies = await asyncio.to_thread(
+                    fetch_html_curl,
+                    new_url,
+                    headers,
+                    proxy
+                )
+            else:
+                # cloudscraper 版本
+                text, cookies = await asyncio.to_thread(
+                    fetch_html_cloudscraper,
+                    scraper,
+                    new_url,
+                    proxy
+                )
+            session.cookie_jar.update_cookies(cookies)
+            new_soup = BeautifulSoup(text, "html.parser")
             log(f"✅ 页面抓取成功: {folder_name}")
             break
         except Exception as e:
@@ -171,21 +210,17 @@ async def fetch_character_data(session, character_name, url, language="zh", prox
 
     if new_soup is None:
         try:
-            loop = asyncio.get_event_loop()
+            # 使用 curl_cffi 作为最终 fallback
+            text, cookies = await asyncio.to_thread(
+                fetch_html_curl,
+                new_url,
+                headers,
+                proxy
+            )
 
-            def _fallback_req():
-                s = requests.Session()
-                s.headers.update(scraper.headers)
-                s.cookies.update(scraper.cookies)
-                if proxy:
-                    s.proxies.update({"http": proxy, "https": proxy})
-                r = s.get(new_url, timeout=30)
-                r.raise_for_status()
-                return r.text
-
-            text = await loop.run_in_executor(None, _fallback_req)
-            new_soup = BeautifulSoup(text, 'html.parser')
-            log("使用备用方式")
+            session.cookie_jar.update_cookies(cookies)
+            new_soup = BeautifulSoup(text, "html.parser")
+            log("使用 curl_cffi 备用方式")
             log(f"✅ 备用方式获取页面成功: {folder_name} {'(代理)' if proxy else '(直连)'}")
         except Exception as e:
             log(f"⚠️ 放弃获取页面: {folder_name} - {e}")
@@ -295,7 +330,7 @@ async def download_all(character_names: list[str], urls: list[str], language="zh
     async with aiohttp.ClientSession(headers={"User-Agent": random.choice(USER_AGENTS)}, connector=connector) as session:
         for idx, name in enumerate(character_names, 1):
             for u in urls_to_use:
-                await fetch_character_data(session, name, u, language=language, proxy=working_proxy, scraper=SCRAPER, log_func=log, game=game)
+                await fetch_character_data(session, name, u, language=language, proxy=working_proxy, scraper=None, log_func=log, game=game)
             await asyncio.sleep(random.uniform(2, 5))
             if idx % 5 == 0:
                 log("⏸ 批量抓取完成 5 个角色，额外等待 5~10 秒")
