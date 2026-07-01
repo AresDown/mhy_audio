@@ -102,17 +102,30 @@ async def download_audio(session, audio_url, audio_file_name, status, proxy=None
                     "Accept": "*/*",
                     "Range": "bytes=0-",
                 }
-                data = await asyncio.to_thread(fetch_audio_curl, audio_url, headers, proxy)
+                data = None
+                direct_error = None
+
+                try:
+                    data = await asyncio.to_thread(fetch_audio_curl, audio_url, headers, None)
+                except Exception as e:
+                    direct_error = e
+
+                if data is None and proxy:
+                    try:
+                        data = await asyncio.to_thread(fetch_audio_curl, audio_url, headers, proxy)
+                    except Exception as proxy_error:
+                        direct_error = proxy_error
+                        remove_bad_proxy(proxy, log_func=log_func or print)
+
                 if not data:
-                    raise ValueError("下载内容为空")
+                    raise direct_error or ValueError("下载内容为空")
+
                 with open(audio_file_name, 'wb') as f:
                     f.write(data)
-                    print(f"✅ 下载完成: {audio_file_name}")
-                    return audio_file_name
+                print(f"✅ 下载完成: {audio_file_name}")
+                return audio_file_name
             except Exception as e:
                 print(f"⚠️ 下载失败 ({attempt+1}/{retries}): {audio_file_name} - {e}")
-                if attempt == retries - 1 and proxy:
-                    remove_bad_proxy(proxy)
                 if attempt < retries - 1:
                     await asyncio.sleep(2 ** attempt)
         print(f"❌ 放弃下载: {audio_file_name}")
