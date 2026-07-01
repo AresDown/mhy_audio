@@ -1,5 +1,5 @@
 import os, sys, re, asyncio, aiohttp, random, json, cloudscraper
-from urllib.parse import urljoin
+from urllib.parse import urljoin, quote
 from bs4 import BeautifulSoup
 from tools.proxy_manager import fetch_free_proxies, get_working_proxy, remove_bad_proxy
 from curl_cffi import requests as curl_requests
@@ -25,6 +25,12 @@ def get_base_path():
 
 def clean_filename(filename):
     return re.sub(r'[\\/*?:"<>|]', "_", filename)
+
+def normalize_fandom_base(url):
+    base = url.rstrip('/')
+    if base.endswith('/wiki'):
+        return base[:-5]
+    return base
 
 # -------------------- 总状态管理 --------------------
 def load_total_status():
@@ -68,19 +74,39 @@ def is_already_downloaded(character_name, language):
 # -------------------- 下载函数 --------------------
 semaphore = asyncio.Semaphore(CONCURRENT_DOWNLOADS)
 
+def fetch_audio_curl(audio_url, headers, proxy=None, timeout=60):
+    proxies = None
+    if proxy:
+        proxies = {"http": f"http://{proxy}", "https": f"http://{proxy}"}
+
+    resp = curl_requests.get(
+        audio_url,
+        headers=headers,
+        proxies=proxies,
+        impersonate="chrome120",
+        timeout=timeout,
+        verify=False,
+    )
+    resp.raise_for_status()
+    return resp.content
+
 async def download_audio(session, audio_url, audio_file_name, status, proxy=None, retries=MAX_RETRIES, log_func=None):
     if os.path.exists(audio_file_name) and os.path.getsize(audio_file_name) > 0:
         return audio_file_name
     async with semaphore:
         for attempt in range(retries):
             try:
-                async with session.get(audio_url, proxy=proxy, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-                    resp.raise_for_status()
-                    data = await resp.read()
-                    if not data:
-                        raise ValueError("下载内容为空")
-                    with open(audio_file_name, 'wb') as f:
-                        f.write(data)
+                headers = {
+                    "User-Agent": session.headers.get("User-Agent", random.choice(USER_AGENTS)),
+                    "Referer": session.headers.get("Referer", ""),
+                    "Accept": "*/*",
+                    "Range": "bytes=0-",
+                }
+                data = await asyncio.to_thread(fetch_audio_curl, audio_url, headers, proxy)
+                if not data:
+                    raise ValueError("下载内容为空")
+                with open(audio_file_name, 'wb') as f:
+                    f.write(data)
                     print(f"✅ 下载完成: {audio_file_name}")
                     return audio_file_name
             except Exception as e:
@@ -109,6 +135,62 @@ def fetch_html_curl(url, headers, proxy=None, timeout=30):
     resp.raise_for_status()
     return resp.text, resp.cookies
 
+def build_voice_page_urls(base_url, english_name, language):
+    lang_map = {
+        "zh": "Chinese",
+        "en": "",
+        "ja": "Japanese",
+        "ko": "Korean",
+    }
+    lang_folder = lang_map.get(language, "Chinese")
+    page_path = f"{english_name}/Voice-Overs/{lang_folder}" if lang_folder else f"{english_name}/Voice-Overs"
+    base_url = normalize_fandom_base(base_url)
+    page_url = f"{base_url}/wiki/{page_path}"
+    api_url = f"{base_url}/api.php?action=parse&page={quote(page_path, safe='/')}&prop=text&format=json&formatversion=2"
+    return page_url, api_url
+
+async def fetch_page_html(scraper, new_url, api_url, headers, proxy=None, log_func: callable = None):
+    log = print if log_func is None else log_func
+
+    try:
+        page_text, _ = await asyncio.to_thread(fetch_html_cloudscraper, scraper, new_url, proxy)
+        if page_text:
+            log("✅ 页面抓取成功")
+            return page_text
+    except Exception as e:
+        log(f"⚠️ cloudscraper 页面抓取失败: {e}")
+
+    try:
+        api_text, _ = await asyncio.to_thread(fetch_html_curl, api_url, headers, proxy)
+        api_payload = json.loads(api_text)
+        html_text = api_payload.get("parse", {}).get("text", "")
+        if html_text:
+            log("✅ API 抓取成功")
+            return html_text
+    except Exception as e:
+        log(f"⚠️ API 抓取失败: {e}")
+
+    try:
+        page_text, _ = await asyncio.to_thread(fetch_html_curl, new_url, headers, proxy)
+        if page_text:
+            log("✅ 页面抓取成功")
+            return page_text
+    except Exception as e:
+        log(f"⚠️ 页面抓取失败: {e}")
+
+    if proxy:
+        log("⚠️ 代理页面抓取失败，切换为直连重试")
+        remove_bad_proxy(proxy, log_func=log)
+        try:
+            direct_page_text, _ = await asyncio.to_thread(fetch_html_cloudscraper, scraper, new_url, None)
+            if direct_page_text:
+                log("✅ 直连页面抓取成功")
+                return direct_page_text
+        except Exception as e:
+            log(f"⚠️ 直连页面抓取失败: {e}")
+
+    return None
+
 def fetch_html_cloudscraper(scraper, url, proxy=None, timeout=30):
     proxies = None
     if proxy:
@@ -120,13 +202,12 @@ def fetch_html_cloudscraper(scraper, url, proxy=None, timeout=30):
 
 # -------------------- 抓取角色 --------------------
 async def fetch_character_data(session, character_name, url, language="zh", proxy=None, scraper=None, log_func: callable = None, game=""):
-    USE_CURL = True  # 或 False
     log = print if log_func is None else log_func
-    await asyncio.sleep(random.uniform(2, 5))
+    await asyncio.sleep(random.uniform(0.5, 1.5))
 
     english_name = character_name.split('|')[0] if '|' in character_name else character_name
     folder_name = character_name.split('|')[1] if '|' in character_name else character_name
-    base = url.rstrip('/')
+    base = normalize_fandom_base(url)
 
     if is_already_downloaded(character_name, language):
         log(f"跳过已下载角色: {character_name} ({language})")
@@ -134,17 +215,7 @@ async def fetch_character_data(session, character_name, url, language="zh", prox
 
     log(f"\n📥 开始抓取角色: {folder_name}")
 
-    lang_map = {
-        "zh": "Chinese",
-        "en": "",
-        "ja": "Japanese",
-        "ko": "Korean"
-    }
-    lang_folder = lang_map.get(language, "Chinese")
-    if lang_folder:
-        new_url = f"{base}/{english_name}/Voice-Overs/{lang_folder}" if base.endswith('/wiki') else f"{base}/wiki/{english_name}/Voice-Overs/{lang_folder}"
-    else:
-        new_url = f"{base}/{english_name}/Voice-Overs" if base.endswith('/wiki') else f"{base}/wiki/{english_name}/Voice-Overs"
+    new_url, api_url = build_voice_page_urls(base, english_name, language)
     
     if game == "bentie":
         base_folder_name = f"bentie_audio_{language}"
@@ -174,60 +245,29 @@ async def fetch_character_data(session, character_name, url, language="zh", prox
     else:
         scraper.headers.update({"Referer": f"{url}"})
 
-    new_soup = None
-    headers = scraper.headers if scraper else {
+    headers = dict(scraper.headers) if scraper else {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         "Referer": url,
     }
 
-    for attempt in range(3):
+    text = await fetch_page_html(scraper, new_url, api_url, headers, proxy=proxy, log_func=log)
+    if not text:
         try:
-            if USE_CURL:
-                # curl_cffi 版本
-                text, cookies = await asyncio.to_thread(
-                    fetch_html_curl,
-                    new_url,
-                    headers,
-                    proxy
-                )
-            else:
-                # cloudscraper 版本
-                text, cookies = await asyncio.to_thread(
-                    fetch_html_cloudscraper,
-                    scraper,
-                    new_url,
-                    proxy
-                )
-            session.cookie_jar.update_cookies(cookies)
-            new_soup = BeautifulSoup(text, "html.parser")
-            log(f"✅ 页面抓取成功: {folder_name}")
-            break
-        except Exception as e:
-            log(f"[{attempt+1}/3] 获取页面失败: {folder_name} - {e}")
-            await asyncio.sleep(random.uniform(3, 6))
-
-    if new_soup is None:
-        try:
-            # 使用 curl_cffi 作为最终 fallback
-            text, cookies = await asyncio.to_thread(
-                fetch_html_curl,
-                new_url,
-                headers,
-                proxy
-            )
-
-            session.cookie_jar.update_cookies(cookies)
-            new_soup = BeautifulSoup(text, "html.parser")
-            log("使用 curl_cffi 备用方式")
+            text, _ = await asyncio.to_thread(fetch_html_cloudscraper, scraper, new_url, proxy)
+            log("使用备用方式")
             log(f"✅ 备用方式获取页面成功: {folder_name} {'(代理)' if proxy else '(直连)'}")
         except Exception as e:
             log(f"⚠️ 放弃获取页面: {folder_name} - {e}")
             return
 
+    new_soup = BeautifulSoup(text, "html.parser")
+
+    session.headers.update({"Referer": new_url})
+
     rows = new_soup.find_all("tr")
-    log(f"解析到 {len(rows)} 行 HTML 内容")
+    log(f"解析到 HTML 内容")
     tasks, total_audio = [], 0
     for row in rows:
         th_tag = row.find("th", {"class": "hidden"})
@@ -286,7 +326,7 @@ async def fetch_character_data(session, character_name, url, language="zh", prox
         except FileNotFoundError:
             pass
 
-async def download_all(character_names: list[str], urls: list[str], language="zh", game="", log_func: callable = None, use_proxy: bool = False):
+async def download_all(character_names: list[str], urls: list[str], language="zh", game="", log_func: callable = None, use_proxy: bool = False, refresh_proxy_pool: bool = False):
     log = print if log_func is None else log_func
 
     if not game:
@@ -305,7 +345,10 @@ async def download_all(character_names: list[str], urls: list[str], language="zh
     
     working_proxy = None
     if use_proxy:
-        await fetch_free_proxies(log_func=log)
+        if refresh_proxy_pool:
+            await fetch_free_proxies(log_func=log)
+        else:
+            log("🧷 跳过代理池刷新，直接使用本地缓存代理")
         url1 = urls_to_use[0]
         working_proxy = await get_working_proxy(url1, log_func=log)
 
@@ -330,8 +373,8 @@ async def download_all(character_names: list[str], urls: list[str], language="zh
     async with aiohttp.ClientSession(headers={"User-Agent": random.choice(USER_AGENTS)}, connector=connector) as session:
         for idx, name in enumerate(character_names, 1):
             for u in urls_to_use:
-                await fetch_character_data(session, name, u, language=language, proxy=working_proxy, scraper=None, log_func=log, game=game)
-            await asyncio.sleep(random.uniform(2, 5))
+                await fetch_character_data(session, name, u, language=language, proxy=working_proxy, scraper=SCRAPER, log_func=log, game=game)
+            await asyncio.sleep(random.uniform(1, 3))
             if idx % 5 == 0:
                 log("⏸ 批量抓取完成 5 个角色，额外等待 5~10 秒")
-                await asyncio.sleep(random.uniform(5, 10))
+                await asyncio.sleep(random.uniform(2, 4))

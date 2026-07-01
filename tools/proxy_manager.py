@@ -1,4 +1,4 @@
-import os, sys, json, asyncio, cloudscraper, random
+import os, sys, json, asyncio, cloudscraper, random, re
 from curl_cffi import requests
 
 # -------------------- 文件路径 --------------------
@@ -8,6 +8,7 @@ def get_base_path():
     return os.path.dirname(os.path.abspath(__file__))
 
 PROXY_JSON_FILE = os.path.join(get_base_path(), "stable_proxies.json")
+PROXY_PATTERN = re.compile(r"\b(?:(?:\d{1,3}\.){3}\d{1,3}|(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})\s*:\s*\d{2,5}\b")
 
 if not os.path.exists(PROXY_JSON_FILE):
     os.makedirs(os.path.dirname(PROXY_JSON_FILE), exist_ok=True)
@@ -18,12 +19,71 @@ if not os.path.exists(PROXY_JSON_FILE):
 def load_proxy_file():
     if os.path.exists(PROXY_JSON_FILE):
         with open(PROXY_JSON_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            proxy_dict = json.load(f)
+        if not isinstance(proxy_dict, dict):
+            return {}
+        proxy_dict, removed = sanitize_proxy_dict(proxy_dict)
+        if removed:
+            print(f"⚠️ 清理无效代理 {len(removed)} 个")
+        return proxy_dict
     return {}
 
 def save_proxy_file(proxy_dict):
     with open(PROXY_JSON_FILE, "w", encoding="utf-8") as f:
         json.dump(proxy_dict, f, ensure_ascii=False, indent=2)
+
+def is_valid_proxy(proxy):
+    if not proxy or "<" in proxy or ">" in proxy:
+        return False
+    if proxy.count(":") != 1:
+        return False
+    host, port = proxy.rsplit(":", 1)
+    if not host or not port.isdigit():
+        return False
+    port_num = int(port)
+    return 1 <= port_num <= 65535
+
+def extract_proxies(text):
+    candidates = set()
+    try:
+        payload = json.loads(text)
+        if isinstance(payload, dict) and "data" in payload and "proxies" in payload["data"]:
+            candidates.update(str(p).strip() for p in payload["data"]["proxies"])
+        elif isinstance(payload, list):
+            candidates.update(str(p).strip() for p in payload)
+    except Exception:
+        pass
+
+    candidates.update(match.group(0).replace(" ", "") for match in PROXY_PATTERN.finditer(text))
+    return [p for p in candidates if is_valid_proxy(p)]
+
+def sanitize_proxy_dict(proxy_dict):
+    cleaned = {}
+    removed = []
+    for proxy, info in proxy_dict.items():
+        if is_valid_proxy(proxy):
+            cleaned[proxy] = info
+        else:
+            removed.append(proxy)
+    if removed:
+        save_proxy_file(cleaned)
+    return cleaned, removed
+
+def fetch_source_text(url, timeout=15):
+    try:
+        resp = requests.get(
+            url,
+            impersonate="chrome120",
+            timeout=timeout,
+            verify=False,
+        )
+        resp.raise_for_status()
+        return resp.text
+    except Exception:
+        scraper = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "desktop": True})
+        resp = scraper.get(url, timeout=timeout)
+        resp.raise_for_status()
+        return resp.text
 
 # -------------------- Cloudscraper 代理检测 --------------------
 def test_proxy_cloudscraper(proxy: str, test_url: str, timeout=20, log_func=print, verbose=True):
@@ -81,7 +141,13 @@ def test_proxy_curl(proxy: str, test_url: str, timeout=20, log_func=print, verbo
 
 # -------------------- 批量测试 --------------------
 async def test_proxies_batch(proxy_dict, test_url, batch_size=3, log_func=print, verbose=True, max_keep=50):
+    proxy_dict, removed = sanitize_proxy_dict(proxy_dict)
+    if removed:
+        log_func(f"⚠️ 已移除 {len(removed)} 个无效代理")
     keys = list(proxy_dict.keys())
+    if not keys:
+        log_func("🧪 跳过批量测试：没有可测试的代理")
+        return proxy_dict
     log_func(f"🧪 开始批量测试 {len(keys)} 个代理...")
 
     for i in range(0, len(keys), batch_size):
@@ -95,22 +161,28 @@ async def test_proxies_batch(proxy_dict, test_url, batch_size=3, log_func=print,
         results = await asyncio.gather(*tasks)
 
         for proxy, res in zip(batch, results):
+            state = proxy_dict.get(proxy)
+            if state is None:
+                continue
             for scheme in ("http", "https"):
                 if res[scheme]:
-                    proxy_dict[proxy][f"{scheme}_score"] = proxy_dict[proxy].get(f"{scheme}_score", 0) + 1
-                    proxy_dict[proxy][f"{scheme}_fail"] = 0
+                    state[f"{scheme}_score"] = state.get(f"{scheme}_score", 0) + 1
+                    state[f"{scheme}_fail"] = 0
                 else:
-                    proxy_dict[proxy][f"{scheme}_score"] = max(-5, proxy_dict[proxy].get(f"{scheme}_score", 0) - 1)
-                    proxy_dict[proxy][f"{scheme}_fail"] = proxy_dict[proxy].get(f"{scheme}_fail", 0) + 1
+                    state[f"{scheme}_score"] = max(-5, state.get(f"{scheme}_score", 0) - 1)
+                    state[f"{scheme}_fail"] = state.get(f"{scheme}_fail", 0) + 1
 
         for p in list(proxy_dict.keys()):
-            if proxy_dict[p]["http_fail"] >= fail_threshold and proxy_dict[p]["https_fail"] >= fail_threshold:
-                proxy_dict[p]["http_score"] //= 2
-                proxy_dict[p]["https_score"] //= 2
-                proxy_dict[p]["http_fail"] = 0
-                proxy_dict[p]["https_fail"] = 0
+            state = proxy_dict.get(p)
+            if state is None:
+                continue
+            if state.get("http_fail", 0) >= fail_threshold and state.get("https_fail", 0) >= fail_threshold:
+                state["http_score"] //= 2
+                state["https_score"] //= 2
+                state["http_fail"] = 0
+                state["https_fail"] = 0
                 if verbose: log_func(f"⚠️ 代理 {p} 连续失败，健康值减半")
-            if proxy_dict[p]["http_score"] <= 0 and proxy_dict[p]["https_score"] <= 0:
+            if state.get("http_score", 0) <= 0 and state.get("https_score", 0) <= 0:
                 del proxy_dict[p]
                 if verbose: log_func(f"❌ 移除低健康代理: {p}")
 
@@ -130,7 +202,10 @@ async def fetch_free_proxies(log_func=print, rounds=3, test_url=None, verbose=Fa
     proxy_dict = load_proxy_file()
     log_func(f"📂 加载本地代理池: {len(proxy_dict)} 个")
 
-    proxy_dict = await test_proxies_batch(proxy_dict, test_url, log_func=log_func, verbose=verbose, max_keep=max_keep)
+    if proxy_dict:
+        proxy_dict = await test_proxies_batch(proxy_dict, test_url, log_func=log_func, verbose=verbose, max_keep=max_keep)
+    else:
+        log_func("🧪 跳过本地代理检测：本地代理池为空")
     log_func(f"✅ 本地代理检测完成，可用代理: {len(proxy_dict)}")
 
     PROXY_APIS = [
@@ -138,30 +213,21 @@ async def fetch_free_proxies(log_func=print, rounds=3, test_url=None, verbose=Fa
         "https://www.proxy-list.download/api/v1/get?type=https",
         "https://api.getproxylist.com/proxy?protocol=https"
     ]
-    scraper = cloudscraper.create_scraper()
-
     for i in range(rounds):
         log_func(f"🌐 第 {i+1} 次抓取代理...")
+        round_added = 0
         for api_url in PROXY_APIS:
             try:
-                resp = await asyncio.to_thread(scraper.get, api_url, timeout=15)
-                proxies = []
+                text = await asyncio.to_thread(fetch_source_text, api_url, 15)
+                proxies = extract_proxies(text)
 
-                try:
-                    response = json.loads(resp.text)
-                    if "data" in response and "proxies" in response["data"]:
-                        proxies = response["data"]["proxies"]
-                    elif isinstance(response, list):
-                        proxies = response
-                except Exception:
-                    proxies = resp.text.splitlines()
-
-                proxies = [p.strip() for p in proxies if p.strip()]
+                proxies = [p.strip() for p in proxies if is_valid_proxy(p.strip())]
                 log_func(f"获取到 {len(proxies)} 个代理")
 
                 for p in proxies:
                     if p not in proxy_dict:
                         proxy_dict[p] = {"http_score":0, "https_score":0, "http_fail":0, "https_fail":0}
+                        round_added += 1
                     else:
                         proxy_dict[p]["http_score"] = max(proxy_dict[p]["http_score"], 1)
                         proxy_dict[p]["https_score"] = max(proxy_dict[p]["https_score"], 1)
@@ -173,6 +239,10 @@ async def fetch_free_proxies(log_func=print, rounds=3, test_url=None, verbose=Fa
             except Exception as e:
                 log_func(f"❌ 抓取异常: {api_url} {e}")
 
+        if round_added == 0 and not proxy_dict:
+            log_func("⚠️ 本轮没有抓到任何有效代理，提前结束代理抓取")
+            break
+
         await asyncio.sleep(2)
 
     save_proxy_file(proxy_dict)
@@ -182,7 +252,7 @@ async def fetch_free_proxies(log_func=print, rounds=3, test_url=None, verbose=Fa
 # -------------------- 获取工作代理 --------------------
 cached_working_proxies = {}
 
-async def get_working_proxy(url, log_func=print, top_n=20):
+async def get_working_proxy(url, log_func=print, top_n=20, min_score=2):
     scheme = "https" if url.startswith("https") else "http"
     global cached_working_proxies
 
@@ -193,10 +263,10 @@ async def get_working_proxy(url, log_func=print, top_n=20):
             return None
         cached_working_proxies = proxy_dict
 
-    available_proxies = [p for p, info in cached_working_proxies.items() if info[f"{scheme}_score"] > 0]
+    available_proxies = [p for p, info in cached_working_proxies.items() if is_valid_proxy(p) and info.get(f"{scheme}_score", 0) >= min_score]
     if not available_proxies:
         fallback_scheme = "http" if scheme == "https" else "https"
-        available_proxies = [p for p, info in cached_working_proxies.items() if info[f"{fallback_scheme}_score"] > 0]
+        available_proxies = [p for p, info in cached_working_proxies.items() if is_valid_proxy(p) and info.get(f"{fallback_scheme}_score", 0) >= min_score]
         if available_proxies:
             log_func(f"⚠️ {scheme.upper()} 代理不足，使用 {fallback_scheme.upper()} fallback")
             scheme = fallback_scheme
@@ -204,16 +274,23 @@ async def get_working_proxy(url, log_func=print, top_n=20):
             log_func("⚠️ 没有可用代理")
             return None
 
+    if not available_proxies:
+        log_func("⚠️ 没有可用代理")
+        return None
+
     sorted_proxies = sorted(
         available_proxies,
-        key=lambda p: cached_working_proxies[p][f"{scheme}_score"],
+        key=lambda p: cached_working_proxies.get(p, {}).get(f"{scheme}_score", 0),
         reverse=True
     )
     top_proxies = sorted_proxies[:min(top_n, len(sorted_proxies))]
-    weights = [cached_working_proxies[p][f"{scheme}_score"]**2 for p in top_proxies]
+    if not top_proxies:
+        log_func("⚠️ 没有可用代理")
+        return None
+    weights = [max(cached_working_proxies.get(p, {}).get(f"{scheme}_score", 0), 1) ** 2 for p in top_proxies]
     chosen = random.choices(top_proxies, weights=weights, k=1)[0]
 
-    log_func(f"🌐 使用代理: {chosen} ({scheme}) [健康值: {cached_working_proxies[chosen][f'{scheme}_score']}]")
+    log_func(f"🌐 使用代理: {chosen} ({scheme}) [健康值: {cached_working_proxies.get(chosen, {}).get(f'{scheme}_score', 0)}]")
     return chosen
 
 def remove_bad_proxy(proxy, log_func=print):
