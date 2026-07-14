@@ -1,7 +1,7 @@
 import os, sys, re, asyncio, aiohttp, random, json, cloudscraper
 from urllib.parse import urljoin, quote
 from bs4 import BeautifulSoup
-from tools.proxy_manager import fetch_free_proxies, get_working_proxy, remove_bad_proxy
+from tools.proxy_manager import fetch_free_proxies, get_proxy_candidates, get_working_proxy, remove_bad_proxy
 from curl_cffi import requests as curl_requests
 
 # -------------------- 配置 --------------------
@@ -105,17 +105,25 @@ async def download_audio(session, audio_url, audio_file_name, status, proxy=None
                 data = None
                 direct_error = None
 
-                try:
-                    data = await asyncio.to_thread(fetch_audio_curl, audio_url, headers, None)
-                except Exception as e:
-                    direct_error = e
+                if proxy:
+                    proxy_candidates = get_proxy_candidates(audio_url, log_func=log_func or print)
+                    if not proxy_candidates and proxy:
+                        proxy_candidates = [(proxy, "http")]
 
-                if data is None and proxy:
+                    for proxy_url, _scheme in proxy_candidates:
+                        try:
+                            data = await asyncio.to_thread(fetch_audio_curl, audio_url, headers, proxy_url)
+                            if data:
+                                break
+                        except Exception as proxy_error:
+                            direct_error = proxy_error
+                            remove_bad_proxy(proxy_url, log_func=log_func or print)
+
+                if data is None:
                     try:
-                        data = await asyncio.to_thread(fetch_audio_curl, audio_url, headers, proxy)
-                    except Exception as proxy_error:
-                        direct_error = proxy_error
-                        remove_bad_proxy(proxy, log_func=log_func or print)
+                        data = await asyncio.to_thread(fetch_audio_curl, audio_url, headers, None)
+                    except Exception as e:
+                        direct_error = e
 
                 if not data:
                     raise direct_error or ValueError("下载内容为空")
@@ -191,16 +199,28 @@ async def fetch_page_html(scraper, new_url, api_url, headers, proxy=None, log_fu
     except Exception as e:
         log(f"⚠️ 页面抓取失败: {e}")
 
-    if proxy:
-        log("⚠️ 代理页面抓取失败，切换为直连重试")
-        remove_bad_proxy(proxy, log_func=log)
-        try:
-            direct_page_text, _ = await asyncio.to_thread(fetch_html_cloudscraper, scraper, new_url, None)
-            if direct_page_text:
-                log("✅ 直连页面抓取成功")
-                return direct_page_text
-        except Exception as e:
-            log(f"⚠️ 直连页面抓取失败: {e}")
+    return None
+
+async def fetch_page_html_with_proxy_rotation(scraper, new_url, api_url, headers, base_url, log_func: callable = None):
+    log = print if log_func is None else log_func
+    proxy_candidates = get_proxy_candidates(base_url, log_func=log)
+
+    for proxy_url, _scheme in proxy_candidates:
+        page_text = await fetch_page_html(scraper, new_url, api_url, headers, proxy=proxy_url, log_func=log)
+        if page_text:
+            return page_text
+        remove_bad_proxy(proxy_url, log_func=log)
+
+    if proxy_candidates:
+        log("⚠️ 代理池已耗尽，切换为直连重试")
+
+    try:
+        direct_page_text = await fetch_page_html(scraper, new_url, api_url, headers, proxy=None, log_func=log)
+        if direct_page_text:
+            log("✅ 直连页面抓取成功")
+            return direct_page_text
+    except Exception as e:
+        log(f"⚠️ 直连页面抓取失败: {e}")
 
     return None
 
@@ -265,15 +285,10 @@ async def fetch_character_data(session, character_name, url, language="zh", prox
         "Referer": url,
     }
 
-    text = await fetch_page_html(scraper, new_url, api_url, headers, proxy=proxy, log_func=log)
+    text = await fetch_page_html_with_proxy_rotation(scraper, new_url, api_url, headers, url, log_func=log) if proxy else await fetch_page_html(scraper, new_url, api_url, headers, proxy=None, log_func=log)
     if not text:
-        try:
-            text, _ = await asyncio.to_thread(fetch_html_cloudscraper, scraper, new_url, proxy)
-            log("使用备用方式")
-            log(f"✅ 备用方式获取页面成功: {folder_name} {'(代理)' if proxy else '(直连)'}")
-        except Exception as e:
-            log(f"⚠️ 放弃获取页面: {folder_name} - {e}")
-            return
+        log(f"⚠️ 放弃获取页面: {folder_name}")
+        return
 
     new_soup = BeautifulSoup(text, "html.parser")
 

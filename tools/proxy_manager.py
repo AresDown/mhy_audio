@@ -176,13 +176,14 @@ async def test_proxies_batch(proxy_dict, test_url, batch_size=3, log_func=print,
             state = proxy_dict.get(p)
             if state is None:
                 continue
+            state.setdefault("stable", True)
             if state.get("http_fail", 0) >= fail_threshold and state.get("https_fail", 0) >= fail_threshold:
                 state["http_score"] //= 2
                 state["https_score"] //= 2
                 state["http_fail"] = 0
                 state["https_fail"] = 0
                 if verbose: log_func(f"⚠️ 代理 {p} 连续失败，健康值减半")
-            if state.get("http_score", 0) <= 0 and state.get("https_score", 0) <= 0:
+            if state.get("stable", False) and state.get("http_score", 0) <= -3 and state.get("https_score", 0) <= -3:
                 del proxy_dict[p]
                 if verbose: log_func(f"❌ 移除低健康代理: {p}")
 
@@ -226,7 +227,7 @@ async def fetch_free_proxies(log_func=print, rounds=3, test_url=None, verbose=Fa
 
                 for p in proxies:
                     if p not in proxy_dict:
-                        proxy_dict[p] = {"http_score":0, "https_score":0, "http_fail":0, "https_fail":0}
+                        proxy_dict[p] = {"http_score":1, "https_score":1, "http_fail":0, "https_fail":0, "stable": False}
                         round_added += 1
                     else:
                         proxy_dict[p]["http_score"] = max(proxy_dict[p]["http_score"], 1)
@@ -263,16 +264,35 @@ async def get_working_proxy(url, log_func=print, top_n=20, min_score=2):
             return None
         cached_working_proxies = proxy_dict
 
-    available_proxies = [p for p, info in cached_working_proxies.items() if is_valid_proxy(p) and info.get(f"{scheme}_score", 0) >= min_score]
+    available_proxies = [
+        (p, scheme)
+        for p, info in cached_working_proxies.items()
+        if is_valid_proxy(p) and info.get(f"{scheme}_score", 0) >= min_score
+    ]
     if not available_proxies:
         fallback_scheme = "http" if scheme == "https" else "https"
-        available_proxies = [p for p, info in cached_working_proxies.items() if is_valid_proxy(p) and info.get(f"{fallback_scheme}_score", 0) >= min_score]
+        available_proxies = [
+            (p, fallback_scheme)
+            for p, info in cached_working_proxies.items()
+            if is_valid_proxy(p) and info.get(f"{fallback_scheme}_score", 0) >= min_score
+        ]
         if available_proxies:
             log_func(f"⚠️ {scheme.upper()} 代理不足，使用 {fallback_scheme.upper()} fallback")
-            scheme = fallback_scheme
         else:
-            log_func("⚠️ 没有可用代理")
-            return None
+            relaxed_proxies = []
+            for p, info in cached_working_proxies.items():
+                if not is_valid_proxy(p):
+                    continue
+                http_score = info.get("http_score", 0)
+                https_score = info.get("https_score", 0)
+                if max(http_score, https_score) > 0:
+                    relaxed_proxies.append((p, "http" if http_score >= https_score else "https"))
+            if relaxed_proxies:
+                available_proxies = relaxed_proxies
+                log_func("⚠️ 没有达到健康阈值的代理，改用本地缓存中的低分有效代理")
+            else:
+                log_func("⚠️ 没有可用代理")
+                return None
 
     if not available_proxies:
         log_func("⚠️ 没有可用代理")
@@ -280,18 +300,66 @@ async def get_working_proxy(url, log_func=print, top_n=20, min_score=2):
 
     sorted_proxies = sorted(
         available_proxies,
-        key=lambda p: cached_working_proxies.get(p, {}).get(f"{scheme}_score", 0),
+        key=lambda item: cached_working_proxies.get(item[0], {}).get(f"{item[1]}_score", 0),
         reverse=True
     )
     top_proxies = sorted_proxies[:min(top_n, len(sorted_proxies))]
     if not top_proxies:
         log_func("⚠️ 没有可用代理")
         return None
-    weights = [max(cached_working_proxies.get(p, {}).get(f"{scheme}_score", 0), 1) ** 2 for p in top_proxies]
-    chosen = random.choices(top_proxies, weights=weights, k=1)[0]
+    weights = [max(cached_working_proxies.get(p, {}).get(f"{proxy_scheme}_score", 0), 1) ** 2 for p, proxy_scheme in top_proxies]
+    chosen, chosen_scheme = random.choices(top_proxies, weights=weights, k=1)[0]
 
-    log_func(f"🌐 使用代理: {chosen} ({scheme}) [健康值: {cached_working_proxies.get(chosen, {}).get(f'{scheme}_score', 0)}]")
+    log_func(f"🌐 使用代理: {chosen} ({chosen_scheme}) [健康值: {cached_working_proxies.get(chosen, {}).get(f'{chosen_scheme}_score', 0)}]")
     return chosen
+
+def get_proxy_candidates(url, log_func=print, top_n=20, min_score=2):
+    scheme = "https" if url.startswith("https") else "http"
+    global cached_working_proxies
+
+    if not cached_working_proxies:
+        proxy_dict = load_proxy_file()
+        if not proxy_dict:
+            log_func("⚠️ 代理池为空")
+            return []
+        cached_working_proxies = proxy_dict
+
+    candidates = []
+
+    def collect_by_scheme(target_scheme, threshold):
+        return [
+            (p, target_scheme)
+            for p, info in cached_working_proxies.items()
+            if is_valid_proxy(p) and info.get(f"{target_scheme}_score", 0) >= threshold
+        ]
+
+    candidates = collect_by_scheme(scheme, min_score)
+    if not candidates:
+        fallback_scheme = "http" if scheme == "https" else "https"
+        candidates = collect_by_scheme(fallback_scheme, min_score)
+        if candidates:
+            log_func(f"⚠️ {scheme.upper()} 代理不足，使用 {fallback_scheme.upper()} fallback")
+        else:
+            relaxed_candidates = []
+            for p, info in cached_working_proxies.items():
+                if not is_valid_proxy(p):
+                    continue
+                http_score = info.get("http_score", 0)
+                https_score = info.get("https_score", 0)
+                if max(http_score, https_score) > 0:
+                    relaxed_candidates.append((p, "http" if http_score >= https_score else "https"))
+            if relaxed_candidates:
+                candidates = relaxed_candidates
+                log_func("⚠️ 没有达到健康阈值的代理，改用本地缓存中的低分有效代理")
+            else:
+                return []
+
+    candidates = sorted(
+        candidates,
+        key=lambda item: cached_working_proxies.get(item[0], {}).get(f"{item[1]}_score", 0),
+        reverse=True,
+    )
+    return candidates[:min(top_n, len(candidates))]
 
 def remove_bad_proxy(proxy, log_func=print):
     global cached_working_proxies
