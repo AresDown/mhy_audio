@@ -80,3 +80,8 @@ Ashveil|不死途
 Silver_Wolf_LV.999|银狼LV.999
 Evanescia|绯英
 Mortenax_Blade|千冶•刃
+Himeko_•_Nova|姬子•启行
+Aventurine_•_Waveflair|砂金•戏浪
+Gilgamesh|吉尔伽美什(联动角色)
+Rin_Tohsaka|远坂凛(联动角色)
+Robin_•_Summeretto|知更鸟•晴歌
